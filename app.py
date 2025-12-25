@@ -1,5 +1,5 @@
 import streamlit as st
-import csv
+import pandas as pd
 import requests
 import time
 import os
@@ -16,8 +16,8 @@ st.set_page_config(page_title="ISSN Metadata Extractor", layout="wide")
 
 st.title("ISSN Article Metadata Extractor (Crossref)")
 st.write(
-    "Use this app to **test with manual ISSNs** or **run using CSV upload**. "
-    "You can also use **both together**."
+    "Upload **CSV / Excel / TXT** or manually enter ISSNs. "
+    "Extract article metadata from Crossref for a selected date range."
 )
 
 # ---- Date range ----
@@ -28,17 +28,17 @@ with col2:
     to_date = st.date_input("To publication date", value=date(2025, 12, 31))
 
 # ---- Manual ISSN input ----
-st.subheader("Option 1: Enter ISSNs manually (for testing)")
+st.subheader("Option 1: Enter ISSNs manually")
 manual_issns = st.text_area(
     "Enter ISSNs (comma or new-line separated)",
     placeholder="1234-5678\n2345-6789"
 )
 
-# ---- CSV upload ----
-st.subheader("Option 2: Upload ISSN CSV")
+# ---- File upload ----
+st.subheader("Option 2: Upload ISSN file")
 uploaded_file = st.file_uploader(
-    "Upload CSV (column name can be ISSN / issn / Issn)",
-    type=["csv"]
+    "Supported files: CSV, Excel (.xlsx), TXT",
+    type=["csv", "xlsx", "txt"]
 )
 
 run = st.button("Run Extraction")
@@ -62,55 +62,59 @@ def fetch_articles(issn, from_date, to_date):
         pass
     return []
 
-def normalize_issn_list(raw_list):
+def normalize_issns(issns):
     clean = []
-    for i in raw_list:
+    for i in issns:
         if i:
             clean.append(i.strip())
-    return list(set(clean))  # remove duplicates
+    return sorted(set(clean))  # remove duplicates
+
+def extract_issns_from_file(file):
+    issns = []
+    file_name = file.name.lower()
+
+    if file_name.endswith(".csv"):
+        df = pd.read_csv(file)
+        for col in df.columns:
+            if "issn" in col.lower():
+                issns.extend(df[col].astype(str).tolist())
+                break
+
+    elif file_name.endswith(".xlsx"):
+        df = pd.read_excel(file)
+        for col in df.columns:
+            if "issn" in col.lower():
+                issns.extend(df[col].astype(str).tolist())
+                break
+
+    elif file_name.endswith(".txt"):
+        content = file.getvalue().decode("utf-8", errors="ignore")
+        issns.extend(content.splitlines())
+
+    return issns
 
 # ================= MAIN =================
 if run:
 
+    # ---- Validation ----
     if from_date > to_date:
         st.error("From date must be earlier than To date.")
         st.stop()
 
     issns = []
 
-    # ---- Manual ISSNs ----
+    # ---- Manual ----
     if manual_issns.strip():
-        manual_list = manual_issns.replace(",", "\n").splitlines()
-        issns.extend(manual_list)
+        issns.extend(manual_issns.replace(",", "\n").splitlines())
 
-    # ---- CSV ISSNs ----
+    # ---- File ----
     if uploaded_file:
-        reader = csv.DictReader(
-            uploaded_file.getvalue().decode("utf-8", errors="ignore").splitlines()
-        )
+        issns.extend(extract_issns_from_file(uploaded_file))
 
-        if not reader.fieldnames:
-            st.error("Uploaded CSV has no header row.")
-            st.stop()
-
-        headers = [h.strip().lower() for h in reader.fieldnames]
-
-        if "issn" not in headers:
-            st.error("CSV must contain a column named 'issn'.")
-            st.stop()
-
-        issn_index = headers.index("issn")
-
-        for row in reader:
-            value = list(row.values())[issn_index]
-            if value:
-                issns.append(value)
-
-    # ---- Final validation ----
-    issns = normalize_issn_list(issns)
+    issns = normalize_issns(issns)
 
     if not issns:
-        st.error("Please enter ISSNs manually or upload a CSV.")
+        st.error("No ISSNs found. Please enter ISSNs or upload a valid file.")
         st.stop()
 
     st.success(f"Total ISSNs to process: {len(issns)}")
@@ -120,7 +124,7 @@ if run:
 
     progress = st.progress(0)
     total = len(issns)
-    done = 0
+    completed = 0
 
     file_part = 1
     rows_written = 0
@@ -129,59 +133,58 @@ if run:
     def open_new_file(part):
         filename = f"output/issn_articles_{from_date}_to_{to_date}_part{part}.csv"
         f = open(filename, "w", newline="", encoding="utf-8")
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "ISSN",
-                "DOI",
-                "Article Title",
-                "Volume",
-                "Issue",
-                "Page",
-                "Journal Title",
-                "Publisher",
-                "From Date",
-                "To Date"
-            ]
-        )
-        writer.writeheader()
+        writer = pd.DataFrame(columns=[
+            "ISSN",
+            "DOI",
+            "Article Title",
+            "Volume",
+            "Issue",
+            "Page",
+            "Journal Title",
+            "Publisher",
+            "From Date",
+            "To Date"
+        ])
         return f, writer, filename
 
-    file, writer, current_file = open_new_file(file_part)
-    generated_files.append(current_file)
+    current_file, buffer_df, current_path = open_new_file(file_part)
+    generated_files.append(current_path)
 
     # ---- Processing ----
     for issn in issns:
         articles = fetch_articles(issn, from_date, to_date)
 
         for art in articles:
-            if rows_written >= MAX_ROWS_PER_FILE:
-                file.close()
-                file_part += 1
-                rows_written = 0
-                file, writer, current_file = open_new_file(file_part)
-                generated_files.append(current_file)
-
-            writer.writerow({
-                "ISSN": issn,
-                "DOI": art.get("DOI"),
-                "Article Title": art.get("title", [""])[0],
-                "Volume": art.get("volume"),
-                "Issue": art.get("issue"),
-                "Page": art.get("page"),
-                "Journal Title": art.get("container-title", [""])[0],
-                "Publisher": art.get("publisher"),
-                "From Date": str(from_date),
-                "To Date": str(to_date)
-            })
+            buffer_df.loc[len(buffer_df)] = [
+                issn,
+                art.get("DOI"),
+                art.get("title", [""])[0],
+                art.get("volume"),
+                art.get("issue"),
+                art.get("page"),
+                art.get("container-title", [""])[0],
+                art.get("publisher"),
+                str(from_date),
+                str(to_date)
+            ]
 
             rows_written += 1
 
-        time.sleep(SLEEP)
-        done += 1
-        progress.progress(min(done / total, 1.0))
+            if rows_written >= MAX_ROWS_PER_FILE:
+                buffer_df.to_csv(current_file, index=False)
+                current_file.close()
 
-    file.close()
+                file_part += 1
+                rows_written = 0
+                current_file, buffer_df, current_path = open_new_file(file_part)
+                generated_files.append(current_path)
+
+        time.sleep(SLEEP)
+        completed += 1
+        progress.progress(min(completed / total, 1.0))
+
+    buffer_df.to_csv(current_file, index=False)
+    current_file.close()
 
     # ---- Download ----
     st.success("Extraction completed successfully!")
