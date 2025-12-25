@@ -3,38 +3,55 @@ import csv
 import requests
 import time
 import os
+from datetime import date
 
 # ================= CONFIG =================
-ROWS_PER_ISSN = 50               # safe for Streamlit Cloud
-MAX_ROWS_PER_FILE = 200_000      # browser + Power BI friendly
+ROWS_PER_ISSN = 50               # Safe for Streamlit Cloud
+MAX_ROWS_PER_FILE = 200_000      # Power BI friendly
 SLEEP = 1
-HEADERS = {"User-Agent": "ISSN-Streamlit-GitHub/1.0"}
+HEADERS = {"User-Agent": "ISSN-DateRange-Extractor/1.0"}
 
 # ================= UI =================
 st.set_page_config(page_title="ISSN Metadata Extractor", layout="wide")
 
-st.title("ISSN Article Metadata Extractor")
-st.write("Upload ISSN list and extract **year-wise, month-wise article metadata** (Crossref).")
-
-year = st.number_input(
-    "Select Publication Year",
-    min_value=1900,
-    max_value=2100,
-    value=2025
+st.title("ISSN Article Metadata Extractor (Crossref)")
+st.write(
+    "Use this app to **test with manual ISSNs** or **run using CSV upload**. "
+    "You can also use **both together**."
 )
 
+# ---- Date range ----
+col1, col2 = st.columns(2)
+with col1:
+    from_date = st.date_input("From publication date", value=date(2025, 1, 1))
+with col2:
+    to_date = st.date_input("To publication date", value=date(2025, 12, 31))
+
+# ---- Manual ISSN input ----
+st.subheader("Option 1: Enter ISSNs manually (for testing)")
+manual_issns = st.text_area(
+    "Enter ISSNs (comma or new-line separated)",
+    placeholder="1234-5678\n2345-6789"
+)
+
+# ---- CSV upload ----
+st.subheader("Option 2: Upload ISSN CSV")
 uploaded_file = st.file_uploader(
-    "Upload ISSN CSV file (must contain an ISSN column)",
+    "Upload CSV (column name can be ISSN / issn / Issn)",
     type=["csv"]
 )
 
 run = st.button("Run Extraction")
 
 # ================= FUNCTIONS =================
-def fetch_articles(issn, year, month):
+def fetch_articles(issn, from_date, to_date):
     url = "https://api.crossref.org/works"
     params = {
-        "filter": f"issn:{issn},from-pub-date:{year}-{month:02d}-01,until-pub-date:{year}-{month:02d}-31",
+        "filter": (
+            f"issn:{issn},"
+            f"from-pub-date:{from_date},"
+            f"until-pub-date:{to_date}"
+        ),
         "rows": ROWS_PER_ISSN
     }
     try:
@@ -45,118 +62,128 @@ def fetch_articles(issn, year, month):
         pass
     return []
 
+def normalize_issn_list(raw_list):
+    clean = []
+    for i in raw_list:
+        if i:
+            clean.append(i.strip())
+    return list(set(clean))  # remove duplicates
+
 # ================= MAIN =================
 if run:
 
-    # ---------- VALIDATE FILE ----------
-    if not uploaded_file:
-        st.error("Please upload a CSV file.")
+    if from_date > to_date:
+        st.error("From date must be earlier than To date.")
         st.stop()
 
-    reader = csv.DictReader(
-        uploaded_file.getvalue().decode("utf-8", errors="ignore").splitlines()
-    )
-
-    # Normalize column names
-    if not reader.fieldnames:
-        st.error("CSV file has no header row.")
-        st.stop()
-
-    normalized_headers = [h.strip().lower() for h in reader.fieldnames]
-
-    if "issn" not in normalized_headers:
-        st.error("CSV must contain a column named 'issn' (any case allowed).")
-        st.stop()
-
-    issn_index = normalized_headers.index("issn")
-
-    # ---------- LOAD ISSNS ----------
     issns = []
-    for row in reader:
-        value = list(row.values())[issn_index]
-        if value:
-            issns.append(value.strip())
+
+    # ---- Manual ISSNs ----
+    if manual_issns.strip():
+        manual_list = manual_issns.replace(",", "\n").splitlines()
+        issns.extend(manual_list)
+
+    # ---- CSV ISSNs ----
+    if uploaded_file:
+        reader = csv.DictReader(
+            uploaded_file.getvalue().decode("utf-8", errors="ignore").splitlines()
+        )
+
+        if not reader.fieldnames:
+            st.error("Uploaded CSV has no header row.")
+            st.stop()
+
+        headers = [h.strip().lower() for h in reader.fieldnames]
+
+        if "issn" not in headers:
+            st.error("CSV must contain a column named 'issn'.")
+            st.stop()
+
+        issn_index = headers.index("issn")
+
+        for row in reader:
+            value = list(row.values())[issn_index]
+            if value:
+                issns.append(value)
+
+    # ---- Final validation ----
+    issns = normalize_issn_list(issns)
 
     if not issns:
-        st.error("No ISSNs found in the uploaded file.")
+        st.error("Please enter ISSNs manually or upload a CSV.")
         st.stop()
 
-    st.success(f"Loaded {len(issns)} ISSNs")
+    st.success(f"Total ISSNs to process: {len(issns)}")
 
-    # ---------- OUTPUT SETUP ----------
+    # ---- Output setup ----
     os.makedirs("output", exist_ok=True)
 
     progress = st.progress(0)
-    total_steps = len(issns) * 12
-    completed = 0
+    total = len(issns)
+    done = 0
 
+    file_part = 1
+    rows_written = 0
     generated_files = []
 
-    # ---------- PROCESS MONTHS ----------
-    for month in range(1, 13):
-        month_str = f"{year}-{month:02d}"
-        st.write(f"Processing {month_str}")
+    def open_new_file(part):
+        filename = f"output/issn_articles_{from_date}_to_{to_date}_part{part}.csv"
+        f = open(filename, "w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "ISSN",
+                "DOI",
+                "Article Title",
+                "Volume",
+                "Issue",
+                "Page",
+                "Journal Title",
+                "Publisher",
+                "From Date",
+                "To Date"
+            ]
+        )
+        writer.writeheader()
+        return f, writer, filename
 
-        part = 1
-        rows_written = 0
+    file, writer, current_file = open_new_file(file_part)
+    generated_files.append(current_file)
 
-        def open_new_file(part):
-            filename = f"output/issn_articles_{month_str}_part{part}.csv"
-            f = open(filename, "w", newline="", encoding="utf-8")
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "Year",
-                    "Month",
-                    "ISSN",
-                    "DOI",
-                    "Article Title",
-                    "Volume",
-                    "Issue",
-                    "Page",
-                    "Journal Title",
-                    "Publisher"
-                ]
-            )
-            writer.writeheader()
-            return f, writer, filename
+    # ---- Processing ----
+    for issn in issns:
+        articles = fetch_articles(issn, from_date, to_date)
 
-        file, writer, current_file = open_new_file(part)
-        generated_files.append(current_file)
+        for art in articles:
+            if rows_written >= MAX_ROWS_PER_FILE:
+                file.close()
+                file_part += 1
+                rows_written = 0
+                file, writer, current_file = open_new_file(file_part)
+                generated_files.append(current_file)
 
-        for issn in issns:
-            articles = fetch_articles(issn, year, month)
+            writer.writerow({
+                "ISSN": issn,
+                "DOI": art.get("DOI"),
+                "Article Title": art.get("title", [""])[0],
+                "Volume": art.get("volume"),
+                "Issue": art.get("issue"),
+                "Page": art.get("page"),
+                "Journal Title": art.get("container-title", [""])[0],
+                "Publisher": art.get("publisher"),
+                "From Date": str(from_date),
+                "To Date": str(to_date)
+            })
 
-            for art in articles:
-                if rows_written >= MAX_ROWS_PER_FILE:
-                    file.close()
-                    part += 1
-                    rows_written = 0
-                    file, writer, current_file = open_new_file(part)
-                    generated_files.append(current_file)
+            rows_written += 1
 
-                writer.writerow({
-                    "Year": year,
-                    "Month": month_str,
-                    "ISSN": issn,
-                    "DOI": art.get("DOI"),
-                    "Article Title": art.get("title", [""])[0],
-                    "Volume": art.get("volume"),
-                    "Issue": art.get("issue"),
-                    "Page": art.get("page"),
-                    "Journal Title": art.get("container-title", [""])[0],
-                    "Publisher": art.get("publisher")
-                })
+        time.sleep(SLEEP)
+        done += 1
+        progress.progress(min(done / total, 1.0))
 
-                rows_written += 1
+    file.close()
 
-            time.sleep(SLEEP)
-            completed += 1
-            progress.progress(min(completed / total_steps, 1.0))
-
-        file.close()
-
-    # ---------- DOWNLOAD ----------
+    # ---- Download ----
     st.success("Extraction completed successfully!")
 
     st.subheader("Download CSV files (Power BI ready)")
